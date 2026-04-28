@@ -13,7 +13,7 @@ gym.envs.registration.register(
 env = gym.make('CarRacingCustom-v0', render_mode="human")
 
 # Завантажуємо навчену модель (ту, що ми тренували з Optuna)
-model = PPO.load("ppo_car_racing_optimized", device="cpu")
+model = PPO.load("best_model/best_model.zip", device="cpu")
 
 observation, info = env.reset()
 total_reward = 0

@@ -4,9 +4,16 @@ import subprocess
 import webbrowser
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.callbacks import EvalCallback
 from custom_env import CarRacingCustom
+
+# Лінійне зменшення learning_rate від initial до 0
+def linear_schedule(initial_value):
+    def func(progress_remaining):
+        return progress_remaining * initial_value
+    return func
 
 # Реєструємо середовище
 gym.envs.registration.register(
@@ -43,7 +50,7 @@ def optimize_ppo(trial):
         n_steps=n_steps,
         batch_size=batch_size,
         verbose=0,
-        device="cpu"
+        device="cuda"
     )
     
     # 4. Швидке тренування (збільшено до 150 000 кроків для адекватної оцінки)
@@ -82,18 +89,25 @@ if __name__ == '__main__':
         # Твій звичайний блок для фінального довгого навчання
         # (Впиши сюди найкращі параметри після оптимізації)
         best_params = {
-          'learning_rate': 3e-4,
+          'learning_rate': linear_schedule(3e-4),
           'gamma': 0.99,
-          'ent_coef': 0.01,
+          'ent_coef': 0.001,
           'clip_range': 0.2,
           'n_steps': 512,
-          'batch_size': 64
+          'batch_size': 64,
+          'target_kl': 0.01
         }
         
         print("Починаємо фінальне навчання з найкращими параметрами...")
-        env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv, env_kwargs={"track_name": "track_01"})
-        model = PPO("MlpPolicy", env, verbose=1, device="cpu",
-                    tensorboard_log="./tb_logs/", **best_params)
+        raw_env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv, env_kwargs={"track_name": "track_01"})
+        
+        # VecNormalize: нормалізує нагороди до маленьких значень (спостереження вже нормалізовані)
+        env = VecNormalize(raw_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        
+        model = PPO("MlpPolicy", env, verbose=1, device="cuda",
+                    tensorboard_log="./tb_logs/",
+                    policy_kwargs=dict(net_arch=[256, 256]),
+                    **best_params)
         
         # Запускаємо TensorBoard автоматично у фоні
         tb_process = subprocess.Popen(
@@ -103,8 +117,21 @@ if __name__ == '__main__':
         webbrowser.open("http://localhost:6006")
         print("TensorBoard запущено: http://localhost:6006")
         
-        model.learn(total_timesteps=1000000)
+        # Зберігаємо найкращу модель автоматично
+        eval_raw = make_vec_env('CarRacingCustom-v0', n_envs=1, env_kwargs={"track_name": "track_01"})
+        eval_env = VecNormalize(eval_raw, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        eval_cb = EvalCallback(
+            eval_env,
+            best_model_save_path="./best_model/",
+            eval_freq=25_000 // 8,
+            n_eval_episodes=5,
+            deterministic=True,
+            verbose=1
+        )
+        
+        model.learn(total_timesteps=1000000, callback=eval_cb)
         
         model.save("ppo_car_racing_optimized")
         print("Модель збережено!")
+        eval_env.close()
         env.close()

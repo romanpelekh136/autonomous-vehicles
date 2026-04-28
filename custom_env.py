@@ -199,6 +199,8 @@ class CarRacingCustom(gym.Env):
         speed_bonus = (self.speed / self.max_speed) * 0.8
         reward += speed_bonus * dot
         
+        # Мікро-штраф за відхилення керма (стимул їхати прямо)
+        reward -= abs(action[0]) * 0.005
 
         prev_pos = (self.car_x - self.speed * math.cos(self.angle), 
                     self.car_y + self.speed * math.sin(self.angle))
@@ -301,46 +303,61 @@ class CarRacingCustom(gym.Env):
                     self.cam_x = mouse_pos[0] - old_world_x * self.zoom
                     self.cam_y = mouse_pos[1] - old_world_y * self.zoom
 
-        # Заливаємо екран чорним
-        self.screen.fill((0, 0, 0)) 
-        
-        # Трек
-        self.render_surface.blit(self.track_image, (0, 0))
-
-        target_cp = self.checkpoints[self.current_checkpoint]
-        pygame.draw.line(self.render_surface, (0, 0, 255), (target_cp["x1"], target_cp["y1"]), (target_cp["x2"], target_cp["y2"]), 3)
-
-        angles = np.linspace(-math.pi/2, math.pi/2, self.num_rays)
-        obs = self._get_lidar_data()
-        for i, a in enumerate(angles):
-            ray_angle = self.angle + a
-            end_x = self.car_x + obs[i] * self.max_ray_length * math.cos(ray_angle)
-            end_y = self.car_y - obs[i] * self.max_ray_length * math.sin(ray_angle)
-            pygame.draw.line(self.render_surface, (0, 255, 0), (int(self.car_x), int(self.car_y)), (int(end_x), int(end_y)), 2)
-
-        car_length = 20
-        car_width = 10
-        car_surface = pygame.Surface((car_length, car_width), pygame.SRCALPHA)
-        car_surface.fill((200, 0, 0)) 
-        
-        rotated_car = pygame.transform.rotate(car_surface, math.degrees(self.angle))
-        rect = rotated_car.get_rect(center=(self.car_x, self.car_y))
-        self.render_surface.blit(rotated_car, rect.topleft)
-
-        # Scale and blit render_surface to screen
+        # --- VIEWPORT RENDERING (тільки видима частина карти) ---
+        self.screen.fill((0, 0, 0))
         
         # Автоматичне фокусування камери
         if not self.panning:
-            self.cam_x = (self.width / 2 if self.width < self.window_width else self.window_width / 2) - (self.car_x * self.zoom)
-            self.cam_y = (self.track_height / 2 if self.track_height < (self.window_height - self.panel_height) else (self.window_height - self.panel_height) / 2) - (self.car_y * self.zoom)
+            self.cam_x = self.window_width / 2 - self.car_x * self.zoom
+            self.cam_y = (self.window_height - self.panel_height) / 2 - self.car_y * self.zoom
 
-        if self.zoom == 1.0:
-            scaled_surf = self.render_surface
-        else:
-            scaled_surf = pygame.transform.smoothscale(self.render_surface, 
-                            (int(self.width * self.zoom), int(self.track_height * self.zoom)))
+        # Визначаємо видиму область карти (viewport)
+        vp_x1 = max(0, int(-self.cam_x / self.zoom))
+        vp_y1 = max(0, int(-self.cam_y / self.zoom))
+        vp_x2 = min(self.width, int((-self.cam_x + self.window_width) / self.zoom))
+        vp_y2 = min(self.track_height, int((-self.cam_y + self.window_height - self.panel_height) / self.zoom))
         
-        self.screen.blit(scaled_surf, (int(self.cam_x), int(self.cam_y)))
+        vp_w = max(1, vp_x2 - vp_x1)
+        vp_h = max(1, vp_y2 - vp_y1)
+        
+        # Малюємо тільки видиму частину треку
+        viewport_surf = pygame.Surface((vp_w, vp_h))
+        viewport_surf.blit(self.track_image, (0, 0), area=(vp_x1, vp_y1, vp_w, vp_h))
+        
+        # Чекпоінт (зі зміщенням у viewport)
+        target_cp = self.checkpoints[self.current_checkpoint]
+        pygame.draw.line(viewport_surf, (0, 0, 255), 
+                        (target_cp["x1"] - vp_x1, target_cp["y1"] - vp_y1),
+                        (target_cp["x2"] - vp_x1, target_cp["y2"] - vp_y1), 3)
+        
+        # Лідар
+        angles = np.linspace(-math.pi/2, math.pi/2, self.num_rays)
+        obs = self._get_lidar_data()
+        car_vx = self.car_x - vp_x1
+        car_vy = self.car_y - vp_y1
+        for i, a in enumerate(angles):
+            ray_angle = self.angle + a
+            end_x = car_vx + obs[i] * self.max_ray_length * math.cos(ray_angle)
+            end_y = car_vy - obs[i] * self.max_ray_length * math.sin(ray_angle)
+            pygame.draw.line(viewport_surf, (0, 255, 0), (int(car_vx), int(car_vy)), (int(end_x), int(end_y)), 2)
+        
+        # Машина
+        car_length = 20
+        car_width = 10
+        car_surface = pygame.Surface((car_length, car_width), pygame.SRCALPHA)
+        car_surface.fill((200, 0, 0))
+        rotated_car = pygame.transform.rotate(car_surface, math.degrees(self.angle))
+        rect = rotated_car.get_rect(center=(car_vx, car_vy))
+        viewport_surf.blit(rotated_car, rect.topleft)
+        
+        # Масштабуємо тільки viewport (маленьку частину, не всю карту!)
+        if self.zoom != 1.0:
+            viewport_surf = pygame.transform.scale(viewport_surf, 
+                            (int(vp_w * self.zoom), int(vp_h * self.zoom)))
+        
+        screen_x = int(self.cam_x + vp_x1 * self.zoom)
+        screen_y = int(self.cam_y + vp_y1 * self.zoom)
+        self.screen.blit(viewport_surf, (screen_x, screen_y))
 
         # --- ПАНЕЛЬ ПРИЛАДІВ ---
         panel_y = self.window_height - self.panel_height
