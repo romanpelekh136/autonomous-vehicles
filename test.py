@@ -6,13 +6,14 @@ import time
 
 gym.envs.registration.register(
     id='CarRacingCustom-v0',
-    entry_point='custom_env:CarRacingCustom'
+    entry_point='custom_env:CarRacingCustom',
+    max_episode_steps=2000
 )
 
 env = gym.make('CarRacingCustom-v0', render_mode="human")
 
-# Завантажуємо навчену модель
-model = PPO.load("ppo_car_racing")
+# Завантажуємо навчену модель (ту, що ми тренували з Optuna)
+model = PPO.load("ppo_car_racing_optimized")
 
 observation, info = env.reset()
 total_reward = 0
