@@ -3,11 +3,13 @@ import numpy as np
 from gymnasium import spaces
 import pygame
 import math
+import json
+import os
 
 class CarRacingCustom(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 30}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, track_name="track_01"):
         super().__init__()
         self.render_mode = render_mode
         self.num_rays = 11 
@@ -19,37 +21,44 @@ class CarRacingCustom(gym.Env):
         )
         
         self.observation_space = spaces.Box(
-            low=0.0, high=1000.0, shape=(self.num_rays,), dtype=np.float32
+            low=0.0, high=1.0, shape=(self.num_rays,), dtype=np.float32
         )
 
-        # Додаємо місце для панелі приладів
-        self.width = 800
-        self.track_height = 600
+        image_path = f"{track_name}.png"
+        json_path = f"{track_name}.json"
+        
+        if not os.path.exists(image_path) or not os.path.exists(json_path):
+            raise FileNotFoundError(f"Track files {track_name}.png or {track_name}.json missing.")
+            
+        self.track_image = pygame.image.load(image_path)
+        
+        with open(json_path, 'r') as f:
+            track_data = json.load(f)
+            
+        self.start_x = track_data["start_position"]["x"]
+        self.start_y = track_data["start_position"]["y"]
+        self.start_angle = math.radians(track_data["start_position"]["angle"])
+        
+        self.checkpoints = track_data["checkpoints"]
+
+        self.width = self.track_image.get_width()
+        self.track_height = self.track_image.get_height()
         self.panel_height = 120
         self.height = self.track_height + self.panel_height 
+
+        self.track_color = self.track_image.get_at((int(self.start_x), int(self.start_y)))
 
         self.screen = None
         self.clock = None
         self.font = None 
 
-        self.outer_rect = pygame.Rect(50, 50, 700, 500)
-        self.inner_rect = pygame.Rect(150, 150, 500, 300)
-
-        self.checkpoints = [
-            pygame.Rect(50, 150, 100, 10),
-            pygame.Rect(400, 50, 10, 100),
-            pygame.Rect(650, 150, 100, 10),
-            pygame.Rect(650, 450, 100, 10),
-            pygame.Rect(400, 450, 10, 100),
-            pygame.Rect(50, 450, 100, 10)
-        ]
         self.current_checkpoint = 0
         self.laps = 0 
         self.current_action = [0.0, 0.0, 0.0] 
 
-        self.L = 20.0
-        self.max_speed = 10.0
-        self.max_ray_length = 200
+        self.L = 10
+        self.max_speed = 35.0
+        self.max_ray_length = 350
 
         self.reset()
 
@@ -68,18 +77,23 @@ class CarRacingCustom(gym.Env):
                 ray_y -= math.sin(ray_angle)
                 dist += 1
                 
-                pos = (int(ray_x), int(ray_y))
-                if not self.outer_rect.collidepoint(pos) or self.inner_rect.collidepoint(pos):
+                ix, iy = int(ray_x), int(ray_y)
+                if ix < 0 or ix >= self.width or iy < 0 or iy >= self.track_height:
                     break
-            distances.append(dist)
+                
+                pixel_color = self.track_image.get_at((ix, iy))
+                if pixel_color[0:3] != self.track_color[0:3]:
+                    break
+                    
+            distances.append(dist / self.max_ray_length)
             
         return np.array(distances, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.car_x = 100
-        self.car_y = 300
-        self.angle = math.pi / 2
+        self.car_x = self.start_x
+        self.car_y = self.start_y
+        self.angle = self.start_angle
         self.speed = 0.0
         self.current_checkpoint = 0
         self.laps = 0
@@ -94,8 +108,9 @@ class CarRacingCustom(gym.Env):
         acceleration = action[1]
         brake = action[2]
 
-        self.speed += acceleration * 0.5
-        self.speed -= brake * 1.0
+        self.speed *= 0.98
+        self.speed += acceleration * 1.5
+        self.speed -= brake * 3.0
         self.speed = np.clip(self.speed, 0, self.max_speed)
 
         if self.speed > 0:
@@ -105,17 +120,32 @@ class CarRacingCustom(gym.Env):
         self.car_y -= self.speed * math.sin(self.angle)
 
         terminated = False
-        reward = -0.1 
+        reward = -0.1 - (abs(action[0]) * 0.05)
         
         car_pos = (int(self.car_x), int(self.car_y))
-        if not self.outer_rect.collidepoint(car_pos) or self.inner_rect.collidepoint(car_pos):
+        if car_pos[0] < 0 or car_pos[0] >= self.width or car_pos[1] < 0 or car_pos[1] >= self.track_height:
             terminated = True
             reward = -100.0 
+        else:
+            pixel_color = self.track_image.get_at(car_pos)
+            if pixel_color[0:3] != self.track_color[0:3]:
+                terminated = True
+                reward = -100.0 
 
-        car_rect = pygame.Rect(int(self.car_x - 10), int(self.car_y - 10), 20, 20)
-        target_cp = self.checkpoints[self.current_checkpoint]
+        prev_pos = (self.car_x - self.speed * math.cos(self.angle), 
+                    self.car_y + self.speed * math.sin(self.angle))
+        curr_pos = (self.car_x, self.car_y)
         
-        if car_rect.colliderect(target_cp):
+        target_cp = self.checkpoints[self.current_checkpoint]
+        cp_line = ((target_cp["x1"], target_cp["y1"]), (target_cp["x2"], target_cp["y2"]))
+        
+        def ccw(A, B, C):
+            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+            
+        def intersect(A, B, C, D):
+            return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+            
+        if intersect(prev_pos, curr_pos, cp_line[0], cp_line[1]):
             reward += 10.0 
             if self.current_checkpoint == len(self.checkpoints) - 1:
                 self.laps += 1
@@ -158,42 +188,91 @@ class CarRacingCustom(gym.Env):
     def render(self):
         if self.screen is None:
             pygame.init()
-            self.screen = pygame.display.set_mode((self.width, self.height))
+            self.window_width = min(1280, self.width)
+            self.window_height = min(720, self.track_height) + self.panel_height
+            self.screen = pygame.display.set_mode((self.window_width, self.window_height), pygame.RESIZABLE)
             self.clock = pygame.time.Clock()
             self.font = pygame.font.SysFont('Arial', 20) 
+            self.cam_x = 0.0
+            self.cam_y = 0.0
+            self.zoom = 1.0
+            self.panning = False
+            self.pan_start_mouse = (0, 0)
+            self.pan_start_cam = (0, 0)
+            self.render_surface = pygame.Surface((self.width, self.track_height))
 
-        # Заливаємо екран чорним, малюємо траву тільки у верхній частині
+        # Process events first for responsiveness
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+            elif event.type == pygame.VIDEORESIZE:
+                self.window_width, self.window_height = event.w, event.h
+                self.screen = pygame.display.set_mode((self.window_width, self.window_height), pygame.RESIZABLE)
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 2: # Middle click
+                    self.panning = True
+                    self.pan_start_mouse = pygame.mouse.get_pos()
+                    self.pan_start_cam = (self.cam_x, self.cam_y)
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 2:
+                    self.panning = False
+            elif event.type == pygame.MOUSEMOTION:
+                if self.panning:
+                    mouse_pos = pygame.mouse.get_pos()
+                    self.cam_x = self.pan_start_cam[0] + (mouse_pos[0] - self.pan_start_mouse[0])
+                    self.cam_y = self.pan_start_cam[1] + (mouse_pos[1] - self.pan_start_mouse[1])
+            elif event.type == pygame.MOUSEWHEEL:
+                mouse_pos = pygame.mouse.get_pos()
+                if mouse_pos[1] < self.window_height - self.panel_height:
+                    old_world_x = (mouse_pos[0] - self.cam_x) / self.zoom
+                    old_world_y = (mouse_pos[1] - self.cam_y) / self.zoom
+                    if event.y > 0:
+                        self.zoom = min(5.0, self.zoom * 1.1)
+                    elif event.y < 0:
+                        self.zoom = max(0.1, self.zoom / 1.1)
+                    self.cam_x = mouse_pos[0] - old_world_x * self.zoom
+                    self.cam_y = mouse_pos[1] - old_world_y * self.zoom
+
+        # Заливаємо екран чорним
         self.screen.fill((0, 0, 0)) 
-        pygame.draw.rect(self.screen, (30, 100, 30), (0, 0, self.width, self.track_height))
         
         # Трек
-        pygame.draw.rect(self.screen, (100, 100, 100), self.outer_rect) 
-        pygame.draw.rect(self.screen, (30, 100, 30), self.inner_rect)   
+        self.render_surface.blit(self.track_image, (0, 0))
 
         target_cp = self.checkpoints[self.current_checkpoint]
-        pygame.draw.rect(self.screen, (0, 0, 255), target_cp)
+        pygame.draw.line(self.render_surface, (0, 0, 255), (target_cp["x1"], target_cp["y1"]), (target_cp["x2"], target_cp["y2"]), 3)
 
         angles = np.linspace(-math.pi/2, math.pi/2, self.num_rays)
         obs = self._get_lidar_data()
         for i, a in enumerate(angles):
             ray_angle = self.angle + a
-            end_x = self.car_x + obs[i] * math.cos(ray_angle)
-            end_y = self.car_y - obs[i] * math.sin(ray_angle)
-            pygame.draw.line(self.screen, (0, 255, 0), (int(self.car_x), int(self.car_y)), (int(end_x), int(end_y)), 2)
+            end_x = self.car_x + obs[i] * self.max_ray_length * math.cos(ray_angle)
+            end_y = self.car_y - obs[i] * self.max_ray_length * math.sin(ray_angle)
+            pygame.draw.line(self.render_surface, (0, 255, 0), (int(self.car_x), int(self.car_y)), (int(end_x), int(end_y)), 2)
 
-        car_length = 40
-        car_width = 20
+        car_length = 20
+        car_width = 10
         car_surface = pygame.Surface((car_length, car_width), pygame.SRCALPHA)
         car_surface.fill((200, 0, 0)) 
         
         rotated_car = pygame.transform.rotate(car_surface, math.degrees(self.angle))
         rect = rotated_car.get_rect(center=(self.car_x, self.car_y))
-        self.screen.blit(rotated_car, rect.topleft)
+        self.render_surface.blit(rotated_car, rect.topleft)
+
+        # Scale and blit render_surface to screen
+        if self.zoom == 1.0:
+            scaled_surf = self.render_surface
+        else:
+            scaled_surf = pygame.transform.smoothscale(self.render_surface, 
+                            (int(self.width * self.zoom), int(self.track_height * self.zoom)))
+        
+        self.screen.blit(scaled_surf, (self.cam_x, self.cam_y))
 
         # --- ПАНЕЛЬ ПРИЛАДІВ ---
-        panel_y = self.track_height
-        pygame.draw.rect(self.screen, (40, 40, 40), (0, panel_y, self.width, self.panel_height))
-        pygame.draw.line(self.screen, (200, 200, 200), (0, panel_y), (self.width, panel_y), 3)
+        panel_y = self.window_height - self.panel_height
+        pygame.draw.rect(self.screen, (40, 40, 40), (0, panel_y, self.window_width, self.panel_height))
+        pygame.draw.line(self.screen, (200, 200, 200), (0, panel_y), (self.window_width, panel_y), 3)
 
         # Текстова інформація
         lap_text = self.font.render(f"Laps: {self.laps}", True, (255, 255, 255))
@@ -206,10 +285,6 @@ class CarRacingCustom(gym.Env):
         self._draw_bar("Steer", self.current_action[0], -1.0, 1.0, 250, panel_y + 40, (0, 200, 255))
         self._draw_bar("Gas", self.current_action[1], 0.0, 1.0, 500, panel_y + 20, (0, 255, 0))
         self._draw_bar("Brake", self.current_action[2], 0.0, 1.0, 500, panel_y + 60, (255, 0, 0))
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
 
         pygame.display.flip()
         self.clock.tick(self.metadata["render_fps"])

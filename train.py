@@ -1,5 +1,6 @@
 import gymnasium as gym
 from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
 from custom_env import CarRacingCustom
 
 # Реєструємо середовище
@@ -8,15 +9,15 @@ gym.envs.registration.register(
     entry_point='custom_env:CarRacingCustom'
 )
 
-# Створюємо середовище без візуалізації (щоб вчилося максимально швидко)
-env = gym.make('CarRacingCustom-v0')
+# Створюємо паралельне середовище (8 світів)
+env = make_vec_env('CarRacingCustom-v0', n_envs=8)
 
-# Створюємо модель PPO (MultiInputPolicy підходить для різних типів даних)
-model = PPO("MlpPolicy", env, verbose=1)
+# Створюємо модель PPO
+model = PPO("MlpPolicy", env, verbose=1, n_steps=256)
 
 print("Починаємо навчання...")
-# Тренуємо 50 000 кроків (для початку)
-model.learn(total_timesteps=50000)
+# Тренуємо 150 000 кроків
+model.learn(total_timesteps=150000)
 
 # Зберігаємо навчений "мозок"
 model.save("ppo_car_racing")

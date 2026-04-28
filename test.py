@@ -15,7 +15,7 @@ model = PPO.load("ppo_car_racing")
 observation, info = env.reset()
 total_reward = 0
 
-for _ in range(2000):
+while True:
     # Модель передбачає дію на основі даних з лідара
     action, _states = model.predict(observation, deterministic=True)
     
