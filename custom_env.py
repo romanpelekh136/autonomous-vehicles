@@ -20,8 +20,11 @@ class CarRacingCustom(gym.Env):
             dtype=np.float32
         )
         
+        low_bounds = np.zeros(self.num_rays + 2, dtype=np.float32)
+        low_bounds[-2] = -1.0 # Кермо може бути від'ємним
+
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(self.num_rays,), dtype=np.float32
+            low=low_bounds, high=1.0, dtype=np.float32
         )
 
         image_path = f"{track_name}.png"
@@ -50,6 +53,10 @@ class CarRacingCustom(gym.Env):
         self.track_color = self.track_image.get_at((int(self.start_x), int(self.start_y)))
         self.tr, self.tg, self.tb = self.track_color[0], self.track_color[1], self.track_color[2]
 
+        self.track_mask = (self.track_array[:, :, 0] == self.tr) & \
+                          (self.track_array[:, :, 1] == self.tg) & \
+                          (self.track_array[:, :, 2] == self.tb)
+
         self.screen = None
         self.clock = None
         self.font = None 
@@ -61,6 +68,7 @@ class CarRacingCustom(gym.Env):
         self.L = 10
         self.max_speed = 35.0
         self.max_ray_length = 350
+        self.max_steering_speed = 0.15
 
         self.reset()
 
@@ -83,8 +91,7 @@ class CarRacingCustom(gym.Env):
         collision_mask = np.ones((self.max_ray_length, self.num_rays), dtype=bool)
         
         if np.any(valid):
-            colors = self.track_array[ix[valid], iy[valid]]
-            is_track = (colors[:, 0] == self.tr) & (colors[:, 1] == self.tg) & (colors[:, 2] == self.tb)
+            is_track = self.track_mask[ix[valid], iy[valid]]
             collision_mask[valid] = ~is_track
             
         collision_mask[-1, :] = True
@@ -94,22 +101,43 @@ class CarRacingCustom(gym.Env):
         
         return distances.astype(np.float32)
 
+    def _get_observation(self):
+        lidar_data = self._get_lidar_data()
+        obs = np.concatenate([
+            lidar_data.astype(np.float32),
+            [self.current_steering],
+            [self.speed / self.max_speed]
+        ])
+        return obs.astype(np.float32)
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.car_x = self.start_x
         self.car_y = self.start_y
         self.angle = self.start_angle
         self.speed = 0.0
+        self.current_steering = 0.0
         self.current_checkpoint = 0
         self.laps = 0
+        self.steps_count = 0
         self.current_action = [0.0, 0.0, 0.0]
         
-        observation = self._get_lidar_data()
-        return observation, {}
+        return self._get_observation(), {}
 
     def step(self, action):
+        self.steps_count += 1
         self.current_action = action 
-        steering = action[0] * (math.pi / 4)
+        
+        old_steering = self.current_steering
+        
+        speed_factor = 1.0 - (self.speed / self.max_speed) * 0.5 
+        target_steer = np.clip(action[0], -speed_factor, speed_factor)
+        
+        delta = np.clip(target_steer - self.current_steering, -self.max_steering_speed, self.max_steering_speed)
+        self.current_steering += delta
+        
+        steering = self.current_steering * (math.pi / 4)
+        
         acceleration = action[1]
         brake = action[2]
 
@@ -123,6 +151,17 @@ class CarRacingCustom(gym.Env):
         
         self.car_x += self.speed * math.cos(self.angle)
         self.car_y -= self.speed * math.sin(self.angle)
+
+        car_pos = (int(self.car_x), int(self.car_y))
+        off_track = False
+        
+        if car_pos[0] < 0 or car_pos[0] >= self.width or car_pos[1] < 0 or car_pos[1] >= self.track_height:
+            off_track = True
+        elif not self.track_mask[car_pos[0], car_pos[1]]:
+            off_track = True
+                
+        if off_track:
+            return self._get_observation(), -100.0, True, False, {}
 
         terminated = False
         
@@ -151,25 +190,15 @@ class CarRacingCustom(gym.Env):
         # Базовий штраф за час (щоб не стояла на місці)
         reward = -0.1 
         
-        # 1. Пом'якшений штраф за різке кермо (множник 0.5 замість 2.0)
-        reward -= (abs(action[0]) * (self.speed / self.max_speed)) * 0.5
+        # Штраф за спробу зламати обмежувач керма (використовуємо old_steering)
+        steering_diff = abs(action[0] - old_steering)
+        if steering_diff > self.max_steering_speed:
+            reward -= 0.05 * (self.speed / self.max_speed)
         
-        # 2. Більший стимул їхати прямо (швидкість - це добре) З УРАХУВАННЯМ НАПРЯМКУ!
+        # Бонус за швидкість у правильному напрямку
         speed_bonus = (self.speed / self.max_speed) * 0.8
-        straight_bonus = speed_bonus * (1.0 - abs(action[0]))
+        reward += speed_bonus * dot
         
-        # Якщо їде до цілі (dot > 0), отримує бонус. Якщо назад (dot < 0), отримує штраф!
-        reward += straight_bonus * dot
-        
-        car_pos = (int(self.car_x), int(self.car_y))
-        if car_pos[0] < 0 or car_pos[0] >= self.width or car_pos[1] < 0 or car_pos[1] >= self.track_height:
-            terminated = True
-            reward = -100.0 
-        else:
-            c = self.track_array[car_pos[0], car_pos[1]]
-            if c[0] != self.tr or c[1] != self.tg or c[2] != self.tb:
-                terminated = True
-                reward = -100.0 
 
         prev_pos = (self.car_x - self.speed * math.cos(self.angle), 
                     self.car_y + self.speed * math.sin(self.angle))
@@ -185,12 +214,12 @@ class CarRacingCustom(gym.Env):
             return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
             
         if intersect(prev_pos, curr_pos, cp_line[0], cp_line[1]):
-            reward += 10.0 
+            reward += 20.0 
             if self.current_checkpoint == len(self.checkpoints) - 1:
                 self.laps += 1
             self.current_checkpoint = (self.current_checkpoint + 1) % len(self.checkpoints)
 
-        observation = self._get_lidar_data()
+        observation = self._get_observation()
         truncated = False
 
         return observation, reward, terminated, truncated, {}
@@ -299,13 +328,19 @@ class CarRacingCustom(gym.Env):
         self.render_surface.blit(rotated_car, rect.topleft)
 
         # Scale and blit render_surface to screen
+        
+        # Автоматичне фокусування камери
+        if not self.panning:
+            self.cam_x = (self.width / 2 if self.width < self.window_width else self.window_width / 2) - (self.car_x * self.zoom)
+            self.cam_y = (self.track_height / 2 if self.track_height < (self.window_height - self.panel_height) else (self.window_height - self.panel_height) / 2) - (self.car_y * self.zoom)
+
         if self.zoom == 1.0:
             scaled_surf = self.render_surface
         else:
             scaled_surf = pygame.transform.smoothscale(self.render_surface, 
                             (int(self.width * self.zoom), int(self.track_height * self.zoom)))
         
-        self.screen.blit(scaled_surf, (self.cam_x, self.cam_y))
+        self.screen.blit(scaled_surf, (int(self.cam_x), int(self.cam_y)))
 
         # --- ПАНЕЛЬ ПРИЛАДІВ ---
         panel_y = self.window_height - self.panel_height
@@ -320,7 +355,7 @@ class CarRacingCustom(gym.Env):
         self.screen.blit(speed_text, (30, panel_y + 60))
 
         # Шкали дій
-        self._draw_bar("Steer", self.current_action[0], -1.0, 1.0, 250, panel_y + 40, (0, 200, 255))
+        self._draw_bar("Steer", self.current_steering, -1.0, 1.0, 250, panel_y + 40, (0, 200, 255))
         self._draw_bar("Gas", self.current_action[1], 0.0, 1.0, 500, panel_y + 20, (0, 255, 0))
         self._draw_bar("Brake", self.current_action[2], 0.0, 1.0, 500, panel_y + 60, (255, 0, 0))
 

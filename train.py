@@ -1,5 +1,7 @@
 import gymnasium as gym
 import optuna
+import subprocess
+import webbrowser
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -46,7 +48,7 @@ def optimize_ppo(trial):
     
     # 4. Швидке тренування (збільшено до 150 000 кроків для адекватної оцінки)
     try:
-        model.learn(total_timesteps=150000)
+        model.learn(total_timesteps=250000)
     except Exception as e:
         env.close()
         return -1000.0
@@ -80,19 +82,28 @@ if __name__ == '__main__':
         # Твій звичайний блок для фінального довгого навчання
         # (Впиши сюди найкращі параметри після оптимізації)
         best_params = {
-            'learning_rate': 0.0001417252777348529, 
-            'gamma': 0.984848197853803, 
-            'ent_coef': 0.005347766258285577, 
-            'clip_range': 0.11224583877971807, 
-            'n_steps': 1024, 
-            'batch_size': 64
+          'learning_rate': 3e-4,
+          'gamma': 0.99,
+          'ent_coef': 0.01,
+          'clip_range': 0.2,
+          'n_steps': 512,
+          'batch_size': 64
         }
         
         print("Починаємо фінальне навчання з найкращими параметрами...")
-        env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv)
-        model = PPO("MlpPolicy", env, verbose=1, device="cpu", **best_params)
+        env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv, env_kwargs={"track_name": "track_01"})
+        model = PPO("MlpPolicy", env, verbose=1, device="cpu",
+                    tensorboard_log="./tb_logs/", **best_params)
         
-        model.learn(total_timesteps=5000000)
+        # Запускаємо TensorBoard автоматично у фоні
+        tb_process = subprocess.Popen(
+            ["tensorboard", "--logdir=./tb_logs/", "--port=6006"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        webbrowser.open("http://localhost:6006")
+        print("TensorBoard запущено: http://localhost:6006")
+        
+        model.learn(total_timesteps=1000000)
         
         model.save("ppo_car_racing_optimized")
         print("Модель збережено!")
