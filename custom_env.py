@@ -31,6 +31,7 @@ class CarRacingCustom(gym.Env):
             raise FileNotFoundError(f"Track files {track_name}.png or {track_name}.json missing.")
             
         self.track_image = pygame.image.load(image_path)
+        self.track_array = np.ascontiguousarray(pygame.surfarray.array3d(self.track_image))
         
         with open(json_path, 'r') as f:
             track_data = json.load(f)
@@ -47,6 +48,7 @@ class CarRacingCustom(gym.Env):
         self.height = self.track_height + self.panel_height 
 
         self.track_color = self.track_image.get_at((int(self.start_x), int(self.start_y)))
+        self.tr, self.tg, self.tb = self.track_color[0], self.track_color[1], self.track_color[2]
 
         self.screen = None
         self.clock = None
@@ -63,31 +65,34 @@ class CarRacingCustom(gym.Env):
         self.reset()
 
     def _get_lidar_data(self):
-        angles = np.linspace(-math.pi/2, math.pi/2, self.num_rays)
-        distances = []
-
-        for a in angles:
-            ray_angle = self.angle + a
-            dist = 0
-            ray_x = self.car_x
-            ray_y = self.car_y
+        ray_angles = self.angle + np.linspace(-math.pi/2, math.pi/2, self.num_rays)
+        
+        dx = np.cos(ray_angles)
+        dy = -np.sin(ray_angles)
+        
+        steps = np.arange(1, self.max_ray_length + 1)[:, np.newaxis]
+        
+        ray_x = self.car_x + steps * dx
+        ray_y = self.car_y + steps * dy
+        
+        ix = ray_x.astype(int)
+        iy = ray_y.astype(int)
+        
+        valid = (ix >= 0) & (ix < self.width) & (iy >= 0) & (iy < self.track_height)
+        
+        collision_mask = np.ones((self.max_ray_length, self.num_rays), dtype=bool)
+        
+        if np.any(valid):
+            colors = self.track_array[ix[valid], iy[valid]]
+            is_track = (colors[:, 0] == self.tr) & (colors[:, 1] == self.tg) & (colors[:, 2] == self.tb)
+            collision_mask[valid] = ~is_track
             
-            for step in range(self.max_ray_length):
-                ray_x += math.cos(ray_angle)
-                ray_y -= math.sin(ray_angle)
-                dist += 1
-                
-                ix, iy = int(ray_x), int(ray_y)
-                if ix < 0 or ix >= self.width or iy < 0 or iy >= self.track_height:
-                    break
-                
-                pixel_color = self.track_image.get_at((ix, iy))
-                if pixel_color[0:3] != self.track_color[0:3]:
-                    break
-                    
-            distances.append(dist / self.max_ray_length)
-            
-        return np.array(distances, dtype=np.float32)
+        collision_mask[-1, :] = True
+        
+        hit_indices = np.argmax(collision_mask, axis=0)
+        distances = (hit_indices + 1) / self.max_ray_length
+        
+        return distances.astype(np.float32)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -120,15 +125,49 @@ class CarRacingCustom(gym.Env):
         self.car_y -= self.speed * math.sin(self.angle)
 
         terminated = False
-        reward = -0.1 - (abs(action[0]) * 0.05)
+        
+        # Розрахунок вектору напрямку до наступного чекпоінту
+        target_cp = self.checkpoints[self.current_checkpoint]
+        cp_cx = (target_cp["x1"] + target_cp["x2"]) / 2.0
+        cp_cy = (target_cp["y1"] + target_cp["y2"]) / 2.0
+        
+        dx = cp_cx - self.car_x
+        dy = cp_cy - self.car_y
+        dist = math.hypot(dx, dy)
+        
+        if dist > 0:
+            dir_x = dx / dist
+            dir_y = dy / dist
+        else:
+            dir_x, dir_y = 0.0, 0.0
+            
+        # Вектор напрямку самої машини
+        car_dx = math.cos(self.angle)
+        car_dy = -math.sin(self.angle)
+        
+        # Скалярний добуток (від 1.0 до -1.0)
+        dot = car_dx * dir_x + car_dy * dir_y
+        
+        # Базовий штраф за час (щоб не стояла на місці)
+        reward = -0.1 
+        
+        # 1. Пом'якшений штраф за різке кермо (множник 0.5 замість 2.0)
+        reward -= (abs(action[0]) * (self.speed / self.max_speed)) * 0.5
+        
+        # 2. Більший стимул їхати прямо (швидкість - це добре) З УРАХУВАННЯМ НАПРЯМКУ!
+        speed_bonus = (self.speed / self.max_speed) * 0.8
+        straight_bonus = speed_bonus * (1.0 - abs(action[0]))
+        
+        # Якщо їде до цілі (dot > 0), отримує бонус. Якщо назад (dot < 0), отримує штраф!
+        reward += straight_bonus * dot
         
         car_pos = (int(self.car_x), int(self.car_y))
         if car_pos[0] < 0 or car_pos[0] >= self.width or car_pos[1] < 0 or car_pos[1] >= self.track_height:
             terminated = True
             reward = -100.0 
         else:
-            pixel_color = self.track_image.get_at(car_pos)
-            if pixel_color[0:3] != self.track_color[0:3]:
+            c = self.track_array[car_pos[0], car_pos[1]]
+            if c[0] != self.tr or c[1] != self.tg or c[2] != self.tb:
                 terminated = True
                 reward = -100.0 
 
@@ -204,8 +243,7 @@ class CarRacingCustom(gym.Env):
         # Process events first for responsiveness
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit()
-                return
+                raise KeyboardInterrupt
             elif event.type == pygame.VIDEORESIZE:
                 self.window_width, self.window_height = event.w, event.h
                 self.screen = pygame.display.set_mode((self.window_width, self.window_height), pygame.RESIZABLE)
