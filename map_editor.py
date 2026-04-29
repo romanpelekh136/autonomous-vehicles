@@ -8,7 +8,7 @@ def main():
     if len(sys.argv) > 1:
         track_name = sys.argv[1]
     else:
-        track_name = "track_01"
+        track_name = "track_02"
 
     image_path = f"{track_name}.png"
     if not os.path.exists(image_path):
