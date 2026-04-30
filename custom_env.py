@@ -9,7 +9,7 @@ import os
 class CarRacingCustom(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 60}
 
-    def __init__(self, render_mode=None, track_name="track_02"):
+    def __init__(self, render_mode=None, track_name="track_01"):
         super().__init__()
         self.render_mode = render_mode
         self.num_rays = 21
@@ -122,6 +122,7 @@ class CarRacingCustom(gym.Env):
         self.current_steering = 0.0
         self.current_checkpoint = 0
         self.laps = 0
+        self.total_checkpoints = 0
         self.steps_count = 0
         self.lap_steps = 0  # лічильник кроків поточного кола
         self.stuck_steps = 0  # лічильник кроків стояння на місці
@@ -169,7 +170,11 @@ class CarRacingCustom(gym.Env):
             off_track = True
                 
         if off_track:
-            return self._get_observation(), -100.0, True, False, {}
+            progress = self.total_checkpoints / len(self.checkpoints)
+            return self._get_observation(), -100.0, True, False, {
+                "checkpoints": self.total_checkpoints,
+                "progress": progress
+            }
 
         # Детекція застрягання: якщо машина майже стоїть довше ~2 секунд
         if self.speed < 1.0 and self.steps_count > 100:
@@ -178,7 +183,11 @@ class CarRacingCustom(gym.Env):
             self.stuck_steps = 0
 
         if self.stuck_steps > 120:
-            return self._get_observation(), -100.0, True, False, {}
+            progress = self.total_checkpoints / len(self.checkpoints)
+            return self._get_observation(), -100.0, True, False, {
+                "checkpoints": self.total_checkpoints,
+                "progress": progress
+            }
 
         terminated = False
         
@@ -242,6 +251,7 @@ class CarRacingCustom(gym.Env):
             return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
             
         if intersect(prev_pos, curr_pos, cp_line[0], cp_line[1]):
+            self.total_checkpoints += 1
             reward += 20.0 
             if self.current_checkpoint == len(self.checkpoints) - 1:
                 self.laps += 1
@@ -256,8 +266,12 @@ class CarRacingCustom(gym.Env):
 
         observation = self._get_observation()
         truncated = False
+        progress = self.total_checkpoints / len(self.checkpoints)
 
-        return observation, reward, terminated, truncated, {}
+        return observation, reward, terminated, truncated, {
+            "checkpoints": self.total_checkpoints,
+            "progress": progress
+        }
 
     # Допоміжна функція для малювання шкал
     def _draw_bar(self, label, value, min_val, max_val, x, y, color):

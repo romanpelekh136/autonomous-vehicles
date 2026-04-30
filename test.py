@@ -47,7 +47,12 @@ try:
         env.render()
         
         if terminated or truncated:
-            print(f"Епізод завершено. Нагорода: {total_reward:.2f}")
+            if truncated:
+                reason = "Таймаут (скінчилися кроки)"
+            else:
+                reason = "Аварія (виліт з траси або застрягла)"
+                
+            print(f"Епізод завершено. Причина: {reason}. Нагорода: {total_reward:.2f}")
             
             # Зберігаємо лог заїзду
             log_filename = f"run_log_{int(time.time())}.json"

@@ -1,6 +1,7 @@
 import gymnasium as gym
 import optuna
 import numpy as np
+import random
 import subprocess
 import webbrowser
 from stable_baselines3 import PPO
@@ -8,6 +9,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
 from custom_env import CarRacingCustom
+from stable_baselines3.common.monitor import Monitor
 
 def linear_schedule(initial_value):
     def func(progress_remaining):
@@ -18,16 +20,16 @@ def linear_schedule(initial_value):
 class CheckpointMetricCallback(BaseCallback):
     def __init__(self):
         super().__init__()
-        self.ep_checkpoints = []
+        self.ep_progress = []
 
     def _on_step(self):
         for info in self.locals.get("infos", []):
-            if "checkpoints" in info:
-                self.ep_checkpoints.append(info["checkpoints"])
-                if len(self.ep_checkpoints) >= 100:
-                    mean_cp = np.mean(self.ep_checkpoints)
-                    self.logger.record("custom/mean_checkpoints", mean_cp)
-                    self.ep_checkpoints = []
+            if "progress" in info:
+                self.ep_progress.append(info["progress"])
+                if len(self.ep_progress) >= 100:
+                    mean_prog = np.mean(self.ep_progress)
+                    self.logger.record("custom/mean_progress", mean_prog)
+                    self.ep_progress = []
         return True
 
 gym.envs.registration.register(
@@ -35,19 +37,26 @@ gym.envs.registration.register(
     entry_point='custom_env:CarRacingCustom',
     max_episode_steps=2000
 )
-
+def make_env():
+    tracks = [ "track_02", "track_03", "track_04"]
+    track = random.choice(tracks)
+    def _init():
+        return Monitor(gym.make('CarRacingCustom-v0', track_name=track))
+    return _init
 OPTIMIZE = False
 
 def optimize_ppo(trial):
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
-    gamma = trial.suggest_float("gamma", 0.90, 0.9999)
-    ent_coef = trial.suggest_float("ent_coef", 0.0, 0.05)
-    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
-    n_steps = trial.suggest_categorical("n_steps", [128, 256, 512, 1024])
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+    gamma = trial.suggest_float("gamma", 0.95, 0.999)
+    ent_coef = trial.suggest_float("ent_coef", 1e-8, 0.01, log=True)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.3)
+    n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048])
     batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
-    
-    env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv, env_kwargs={"track_name": "track_02"})
-    
+    target_kl = trial.suggest_float("target_kl", 0.01, 0.05)
+    n_epochs = trial.suggest_int("n_epochs", 3, 15)
+
+    env = SubprocVecEnv([make_env() for _ in range(8)])
+
     model = PPO(
         "MlpPolicy", 
         env, 
@@ -57,34 +66,37 @@ def optimize_ppo(trial):
         clip_range=clip_range,
         n_steps=n_steps,
         batch_size=batch_size,
+        target_kl=target_kl,
+        n_epochs=n_epochs,
+        policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[512, 512])),
         verbose=0,
         device="cpu"
     )
-    
+
     try:
-        model.learn(total_timesteps=250000)
+        model.learn(total_timesteps=300000)
     except Exception as e:
         env.close()
-        return -1000.0
+        return -10000.0
 
     eval_env = make_vec_env('CarRacingCustom-v0', n_envs=1, env_kwargs={"track_name": "track_02"})
-    total_checkpoints = []
+    all_episode_rewards = []
     try:
         for _ in range(5):
             obs = eval_env.reset()
-            if isinstance(obs, tuple):
-                obs, _ = obs
             done = False
+            episode_reward = 0.0
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
-                obs, _, dones, infos = eval_env.step(action)
+                obs, reward, dones, infos = eval_env.step(action)
+                episode_reward += reward[0]
                 done = dones[0]
-            total_checkpoints.append(infos[0].get("checkpoints", 0))
+            all_episode_rewards.append(episode_reward)
     finally:
         env.close()
         eval_env.close()
 
-    return np.mean(total_checkpoints)
+    return np.mean(all_episode_rewards)
 
 if __name__ == '__main__':
     if OPTIMIZE:
@@ -108,7 +120,7 @@ if __name__ == '__main__':
         }
         
         print("Починаємо фінальне навчання з найкращими параметрами...")
-        env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv, env_kwargs={"track_name": "track_02"})
+        env = SubprocVecEnv([make_env() for _ in range(8)])
         
         model = PPO("MlpPolicy", env, verbose=1, device="cpu",
                     tensorboard_log="./tb_logs/",
@@ -122,7 +134,11 @@ if __name__ == '__main__':
         webbrowser.open("http://localhost:6006")
         print("TensorBoard запущено: http://localhost:6006")
         
-        eval_env = make_vec_env('CarRacingCustom-v0', n_envs=1, env_kwargs={"track_name": "track_02"})
+        eval_env = SubprocVecEnv([
+            lambda: gym.make('CarRacingCustom-v0', track_name="track_02"),
+            lambda: gym.make('CarRacingCustom-v0', track_name="track_03"),
+            lambda: gym.make('CarRacingCustom-v0', track_name="track_04")
+        ])
         eval_cb = EvalCallback(
             eval_env,
             best_model_save_path="./best_model/",
