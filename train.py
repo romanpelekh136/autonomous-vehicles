@@ -74,29 +74,41 @@ def optimize_ppo(trial):
     )
 
     try:
-        model.learn(total_timesteps=300000)
+        model.learn(total_timesteps=1_000_000)
     except Exception as e:
         env.close()
         return -10000.0
 
-    eval_env = make_vec_env('CarRacingCustom-v0', n_envs=1, env_kwargs={"track_name": "track_02"})
-    all_episode_rewards = []
+    eval_env = SubprocVecEnv([
+        lambda: gym.make('CarRacingCustom-v0', track_name="track_02"),
+        lambda: gym.make('CarRacingCustom-v0', track_name="track_03"),
+        lambda: gym.make('CarRacingCustom-v0', track_name="track_04")
+    ])
+    
+    total_progress = []
     try:
-        for _ in range(5):
+        for _ in range(3): # 3 епізоди на кожну трасу
             obs = eval_env.reset()
-            done = False
-            episode_reward = 0.0
-            while not done:
+            dones = np.array([False, False, False])
+            episode_progresses = [0.0] * 3
+            
+            while not all(dones):
                 action, _ = model.predict(obs, deterministic=True)
-                obs, reward, dones, infos = eval_env.step(action)
-                episode_reward += reward[0]
-                done = dones[0]
-            all_episode_rewards.append(episode_reward)
+                obs, _, current_dones, infos = eval_env.step(action)
+                
+                for i in range(3):
+                    if not dones[i]:
+                        if "progress" in infos[i]:
+                            episode_progresses[i] = infos[i]["progress"]
+                        if current_dones[i]:
+                            dones[i] = True
+                            
+            total_progress.extend(episode_progresses)
     finally:
         env.close()
         eval_env.close()
 
-    return np.mean(all_episode_rewards)
+    return np.mean(total_progress) if total_progress else 0.0
 
 if __name__ == '__main__':
     if OPTIMIZE:
@@ -110,12 +122,13 @@ if __name__ == '__main__':
         
     else:
         best_params = {
-          'learning_rate': linear_schedule(0.00011308338187272194),
-          'gamma': 0.9831961146510467,
-          'ent_coef': 0.006260879193144504,
-          'clip_range': 0.19157532502131835,
-          'n_steps': 1024,
-          'batch_size': 128,
+          'learning_rate': linear_schedule(0.00011308338187272194),  # старий
+          'gamma': 0.983,           # старий — довший горизонт
+          'ent_coef': 0.0035,       # від Optuna
+          'clip_range': 0.176,      # від Optuna
+          'n_steps': 1024,          # старий
+          'batch_size': 128,        # старий
+          'target_kl': 0.0196,      # від Optuna — новий корисний
           'n_epochs': 10,
         }
         
