@@ -5,6 +5,7 @@ import pygame
 import math
 import json
 import os
+from PIL import Image
 
 class CarRacingCustom(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 60}
@@ -34,8 +35,10 @@ class CarRacingCustom(gym.Env):
         if not os.path.exists(image_path) or not os.path.exists(json_path):
             raise FileNotFoundError(f"Track files {track_name}.png or {track_name}.json missing.")
             
-        self.track_image = pygame.image.load(image_path)
-        self.track_array = np.ascontiguousarray(pygame.surfarray.array3d(self.track_image))
+        pil_img = Image.open(image_path).convert("RGB")
+        self.track_array = np.ascontiguousarray(np.array(pil_img).transpose(1, 0, 2))
+        self._track_image_path = image_path
+        self.track_image = None
         
         with open(json_path, 'r') as f:
             track_data = json.load(f)
@@ -46,13 +49,14 @@ class CarRacingCustom(gym.Env):
         
         self.checkpoints = track_data["checkpoints"]
 
-        self.width = self.track_image.get_width()
-        self.track_height = self.track_image.get_height()
+        self.width = pil_img.width
+        self.track_height = pil_img.height
         self.panel_height = 120
         self.height = self.track_height + self.panel_height 
 
-        self.track_color = self.track_image.get_at((int(self.start_x), int(self.start_y)))
-        self.tr, self.tg, self.tb = self.track_color[0], self.track_color[1], self.track_color[2]
+        self.tr = self.track_array[int(self.start_x), int(self.start_y), 0]
+        self.tg = self.track_array[int(self.start_x), int(self.start_y), 1]
+        self.tb = self.track_array[int(self.start_x), int(self.start_y), 2]
 
         self.track_mask = (self.track_array[:, :, 0] == self.tr) & \
                           (self.track_array[:, :, 1] == self.tg) & \
@@ -309,7 +313,7 @@ class CarRacingCustom(gym.Env):
             self.clock = pygame.time.Clock()
             self.font = pygame.font.SysFont('Arial', 20)
             self._lidar_angles = np.linspace(-math.pi/2, math.pi/2, self.num_rays)
-            self.track_image = self.track_image.convert()
+            self.track_image = pygame.image.load(self._track_image_path).convert()
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:

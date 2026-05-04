@@ -1,8 +1,6 @@
 import gymnasium as gym
-from stable_baselines3 import PPO
+import argparse
 from custom_env import CarRacingCustom
-import json
-import time
 
 gym.envs.registration.register(
     id='CarRacingCustom-v0',
@@ -10,70 +8,53 @@ gym.envs.registration.register(
     max_episode_steps=2000
 )
 
-env = gym.make('CarRacingCustom-v0', render_mode="human")
-
-# Завантажуємо навчену модель (ту, що ми тренували з Optuna)
-model = PPO.load("best_model/best_model.zip", device="cpu")
-
-observation, info = env.reset()
-total_reward = 0
-
-action_log = []
-frame_count = 0
-
-print("Запуск симуляції... Натисніть Ctrl+C в терміналі або закрийте вікно, щоб зупинити.")
-
-try:
+def test_ppo(track_name):
+    from stable_baselines3 import PPO
+    model = PPO.load("models/ppo_best/best_model.zip", device="cpu")
+    env = gym.make('CarRacingCustom-v0', render_mode="human", track_name=track_name)
+    obs, _ = env.reset()
+    
     while True:
-        # Модель передбачає дію на основі даних з лідара
-        action, _states = model.predict(observation, deterministic=True)
-        
-        # Записуємо дію та стан машини
-        action_log.append({
-            "frame": frame_count,
-            "steer": float(action[0]),
-            "gas": float(action[1]),
-            "brake": float(action[2]),
-            "x": float(env.unwrapped.car_x),
-            "y": float(env.unwrapped.car_y),
-            "speed": float(env.unwrapped.speed),
-            "angle": float(env.unwrapped.angle)
-        })
-        frame_count += 1
-        
-        observation, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
         env.render()
-        
         if terminated or truncated:
-            if truncated:
-                reason = "Таймаут (скінчилися кроки)"
-            else:
-                reason = "Аварія (виліт з траси або застрягла)"
-                
-            print(f"Епізод завершено. Причина: {reason}. Нагорода: {total_reward:.2f}")
-            
-            # Зберігаємо лог заїзду
-            log_filename = f"run_log_{int(time.time())}.json"
-            with open(log_filename, "w") as f:
-                json.dump(action_log, f, indent=4)
-            print(f"Лог збережено у файл: {log_filename}")
-            
-            # Скидаємо для наступного заїзду
-            observation, info = env.reset()
-            total_reward = 0
-            action_log = []
-            frame_count = 0
+            obs, _ = env.reset()
 
-except KeyboardInterrupt:
-    print("\nВихід за запитом користувача...")
-    # Зберігаємо лог, якщо вихід відбувся посеред заїзду
-    if action_log:
-        log_filename = f"run_log_partial_{int(time.time())}.json"
-        with open(log_filename, "w") as f:
-            json.dump(action_log, f, indent=4)
-        print(f"Лог незавершеного заїзду збережено у файл: {log_filename}")
+def test_neat(track_name):
+    import neat
+    import pickle
+    with open("models/neat_best.pkl", "rb") as f:
+        winner = pickle.load(f)
+    
+    config = neat.Config(
+        neat.DefaultGenome, neat.DefaultReproduction,
+        neat.DefaultSpeciesSet, neat.DefaultStagnation,
+        "neat_config.txt"
+    )
+    net = neat.nn.FeedForwardNetwork.create(winner, config)
+    env = gym.make('CarRacingCustom-v0', render_mode="human", track_name=track_name)
+    obs, _ = env.reset()
+    
+    while True:
+        output = net.activate(obs)
+        action = [
+            output[0],
+            (output[1] + 1.0) / 2.0,
+            (output[2] + 1.0) / 2.0
+        ]
+        obs, reward, terminated, truncated, info = env.step(action)
+        env.render()
+        if terminated or truncated:
+            obs, _ = env.reset()
 
-finally:
-    env.close()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--method", choices=["ppo", "neat"], default="ppo")
+    parser.add_argument("--track", default="track_02")
+    args = parser.parse_args()
+    
+    if args.method == "ppo":
+        test_ppo(args.track)
+    else:
+        test_neat(args.track)
