@@ -18,6 +18,8 @@ class TensorBoardReporter(BaseReporter):
     def __init__(self, log_dir):
         self.writer = SummaryWriter(log_dir)
         self.generation = 0
+        self.best_fitness = -float('inf')
+        os.makedirs("models/neat_best", exist_ok=True)
 
     def post_evaluate(self, config, population, species, best_genome):
         fitnesses = [c.fitness for c in population.values() if c.fitness is not None]
@@ -37,13 +39,12 @@ class TensorBoardReporter(BaseReporter):
             self.writer.add_scalar("NEAT/avg_nodes", avg_nodes, self.generation)
             self.writer.add_scalar("NEAT/avg_connections", avg_conns, self.generation)
             
-            # Метрика progress для порівняння з PPO
-            best_progress = getattr(best_genome, 'avg_progress', 0)
-            mean_progress = sum(
-                getattr(g, 'avg_progress', 0) for g in population.values()
-            ) / len(population)
-            self.writer.add_scalar("compare/best_progress", best_progress, self.generation)
-            self.writer.add_scalar("compare/mean_progress", mean_progress, self.generation)
+            # Збереження найкращої моделі
+            if best_genome.fitness is not None and best_genome.fitness > self.best_fitness:
+                self.best_fitness = best_genome.fitness
+                with open("models/neat_best/best_model.pkl", "wb") as f:
+                    pickle.dump(best_genome, f)
+                print(f"\n[+] Нова найкраща модель NEAT збережена (Нагорода: {self.best_fitness:.2f})\n")
             
         self.generation += 1
 
@@ -58,17 +59,31 @@ def eval_genome(genome, config):
         obs, _ = env.reset()
         info = {}
         
+        steps_without_cp = 0
+        checkpoints_reached = 0
+        
         for _ in range(2000):
             output = net.activate(obs)
             
             action = [
                 output[0],
-                (output[1] + 1.0) / 2.0,
-                (output[2] + 1.0) / 2.0
+                max(0.0, output[1]),
+                max(0.0, output[2])
             ]
             
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
+            
+            current_cp = info.get("checkpoints", 0)
+            if current_cp > checkpoints_reached:
+                checkpoints_reached = current_cp
+                steps_without_cp = 0
+            else:
+                steps_without_cp += 1
+                
+            if steps_without_cp > 400:
+                total_reward -= 100.0
+                break
             
             if terminated or truncated:
                 break

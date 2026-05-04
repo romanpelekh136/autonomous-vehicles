@@ -1,6 +1,6 @@
 [NEAT]
 fitness_criterion     = max
-fitness_threshold     = 10000
+fitness_threshold     = 50000
 pop_size              = 150
 reset_on_extinction   = False
 no_fitness_termination = False
@@ -17,14 +17,14 @@ enabled_default       = True
 enabled_mutate_rate   = 0.01
 
 weight_init_mean      = 0.0
-weight_init_stdev     = 1.0
+weight_init_stdev     = 0.2
 weight_max_value      = 30.0
 weight_min_value      = -30.0
 weight_mutate_rate    = 0.8
 weight_replace_rate   = 0.1
 weight_mutate_power   = 0.5
 bias_init_mean        = 0.0
-bias_init_stdev       = 1.0
+bias_init_stdev       = 0.2
 bias_max_value        = 30.0
 bias_min_value        = -30.0
 bias_mutate_rate      = 0.7
