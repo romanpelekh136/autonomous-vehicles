@@ -7,12 +7,12 @@ import json
 import os
 
 class CarRacingCustom(gym.Env):
-    metadata = {"render_modes": ["human"], "render_fps": 30}
+    metadata = {"render_modes": ["human"], "render_fps": 60}
 
     def __init__(self, render_mode=None, track_name="track_01"):
         super().__init__()
         self.render_mode = render_mode
-        self.num_rays = 11 
+        self.num_rays = 21
         
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0]),
@@ -20,8 +20,12 @@ class CarRacingCustom(gym.Env):
             dtype=np.float32
         )
         
+        low_bounds = np.zeros(self.num_rays + 5, dtype=np.float32)
+        low_bounds[-5] = -1.0 # Кермо (поточне фізичне)
+        low_bounds[-3] = -1.0 # Минула дія (кермо)
+
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(self.num_rays,), dtype=np.float32
+            low=low_bounds, high=1.0, dtype=np.float32
         )
 
         image_path = f"{track_name}.png"
@@ -50,6 +54,10 @@ class CarRacingCustom(gym.Env):
         self.track_color = self.track_image.get_at((int(self.start_x), int(self.start_y)))
         self.tr, self.tg, self.tb = self.track_color[0], self.track_color[1], self.track_color[2]
 
+        self.track_mask = (self.track_array[:, :, 0] == self.tr) & \
+                          (self.track_array[:, :, 1] == self.tg) & \
+                          (self.track_array[:, :, 2] == self.tb)
+
         self.screen = None
         self.clock = None
         self.font = None 
@@ -57,10 +65,12 @@ class CarRacingCustom(gym.Env):
         self.current_checkpoint = 0
         self.laps = 0 
         self.current_action = [0.0, 0.0, 0.0] 
+        self.prev_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         self.L = 10
         self.max_speed = 35.0
-        self.max_ray_length = 350
+        self.max_ray_length = 800
+        self.max_steering_speed = 0.15
 
         self.reset()
 
@@ -83,8 +93,7 @@ class CarRacingCustom(gym.Env):
         collision_mask = np.ones((self.max_ray_length, self.num_rays), dtype=bool)
         
         if np.any(valid):
-            colors = self.track_array[ix[valid], iy[valid]]
-            is_track = (colors[:, 0] == self.tr) & (colors[:, 1] == self.tg) & (colors[:, 2] == self.tb)
+            is_track = self.track_mask[ix[valid], iy[valid]]
             collision_mask[valid] = ~is_track
             
         collision_mask[-1, :] = True
@@ -94,22 +103,50 @@ class CarRacingCustom(gym.Env):
         
         return distances.astype(np.float32)
 
+    def _get_observation(self):
+        self.cached_lidar = self._get_lidar_data()
+        obs = np.concatenate([
+            self.cached_lidar,
+            [self.current_steering],
+            [self.speed / self.max_speed],
+            self.prev_action  # Дає ШІ пам'ять про минулий кадр
+        ])
+        return obs.astype(np.float32)
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.car_x = self.start_x
         self.car_y = self.start_y
         self.angle = self.start_angle
         self.speed = 0.0
+        self.current_steering = 0.0
         self.current_checkpoint = 0
         self.laps = 0
+        self.total_checkpoints = 0
+        self.steps_count = 0
+        self.lap_steps = 0  # лічильник кроків поточного кола
+        self.stuck_steps = 0  # лічильник кроків стояння на місці
         self.current_action = [0.0, 0.0, 0.0]
+        self.prev_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.cached_lidar = np.zeros(self.num_rays, dtype=np.float32)
         
-        observation = self._get_lidar_data()
-        return observation, {}
+        return self._get_observation(), {}
 
     def step(self, action):
+        self.steps_count += 1
+        self.lap_steps += 1  # рахуємо кроки поточного кола
         self.current_action = action 
-        steering = action[0] * (math.pi / 4)
+        
+        # ПРОГРЕСИВНЕ КЕРМО
+        speed_damping = np.interp(self.speed, [0, self.max_speed], [1.0, 0.2])
+        
+        # Обмежуємо швидкість повороту керма
+        delta = np.clip(action[0] - self.current_steering, -self.max_steering_speed, self.max_steering_speed)
+        self.current_steering += delta
+        
+        # Застосовуємо демпфінг швидкості ДО фінального кута коліс
+        steering = self.current_steering * speed_damping * (math.pi / 4)
+        
         acceleration = action[1]
         brake = action[2]
 
@@ -123,6 +160,34 @@ class CarRacingCustom(gym.Env):
         
         self.car_x += self.speed * math.cos(self.angle)
         self.car_y -= self.speed * math.sin(self.angle)
+
+        car_pos = (int(self.car_x), int(self.car_y))
+        off_track = False
+        
+        if car_pos[0] < 0 or car_pos[0] >= self.width or car_pos[1] < 0 or car_pos[1] >= self.track_height:
+            off_track = True
+        elif not self.track_mask[car_pos[0], car_pos[1]]:
+            off_track = True
+                
+        if off_track:
+            progress = self.total_checkpoints / len(self.checkpoints)
+            return self._get_observation(), -100.0, True, False, {
+                "checkpoints": self.total_checkpoints,
+                "progress": progress
+            }
+
+        # Детекція застрягання: якщо машина майже стоїть довше ~2 секунд
+        if self.speed < 1.0 and self.steps_count > 100:
+            self.stuck_steps += 1
+        else:
+            self.stuck_steps = 0
+
+        if self.stuck_steps > 120:
+            progress = self.total_checkpoints / len(self.checkpoints)
+            return self._get_observation(), -100.0, True, False, {
+                "checkpoints": self.total_checkpoints,
+                "progress": progress
+            }
 
         terminated = False
         
@@ -148,28 +213,29 @@ class CarRacingCustom(gym.Env):
         # Скалярний добуток (від 1.0 до -1.0)
         dot = car_dx * dir_x + car_dy * dir_y
         
-        # Базовий штраф за час (щоб не стояла на місці)
-        reward = -0.1 
-        
-        # 1. Пом'якшений штраф за різке кермо (множник 0.5 замість 2.0)
-        reward -= (abs(action[0]) * (self.speed / self.max_speed)) * 0.5
-        
-        # 2. Більший стимул їхати прямо (швидкість - це добре) З УРАХУВАННЯМ НАПРЯМКУ!
-        speed_bonus = (self.speed / self.max_speed) * 0.8
-        straight_bonus = speed_bonus * (1.0 - abs(action[0]))
-        
-        # Якщо їде до цілі (dot > 0), отримує бонус. Якщо назад (dot < 0), отримує штраф!
-        reward += straight_bonus * dot
-        
-        car_pos = (int(self.car_x), int(self.car_y))
-        if car_pos[0] < 0 or car_pos[0] >= self.width or car_pos[1] < 0 or car_pos[1] >= self.track_height:
-            terminated = True
-            reward = -100.0 
-        else:
-            c = self.track_array[car_pos[0], car_pos[1]]
-            if c[0] != self.tr or c[1] != self.tg or c[2] != self.tb:
-                terminated = True
-                reward = -100.0 
+        # === ФОРМУВАННЯ НАГОРОДИ ===
+        safe_dot = max(dot, 0.0)
+        reward = -0.1
+
+        # Базовий прогрес: чим швидше в правильному напрямку, тим краще
+        speed_ratio = self.speed / self.max_speed
+        reward += speed_ratio * 2.5 * safe_dot
+
+        # Контекстна поведінка (Газ vs Гальмо)
+        forward_ray = self.cached_lidar[self.num_rays // 2]
+
+        if forward_ray > 0.8:
+            # ПРЯМА: Додатково заохочуємо газ, жорстко штрафуємо за гальмо
+            reward += action[1] * 0.2
+            reward -= action[2] * 0.5
+        elif forward_ray < 0.5 and speed_ratio > 0.4:
+            # ПЕРЕД СТІНОЮ (якщо швидкість висока): Бонус за використання гальма
+            # Це знімає "страх" натискати педаль гальма
+            reward += action[2] * 0.3
+
+        # Плавність керма
+        steering_jitter = abs(action[0] - self.prev_action[0])
+        reward -= steering_jitter * 0.15
 
         prev_pos = (self.car_x - self.speed * math.cos(self.angle), 
                     self.car_y + self.speed * math.sin(self.angle))
@@ -185,15 +251,27 @@ class CarRacingCustom(gym.Env):
             return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
             
         if intersect(prev_pos, curr_pos, cp_line[0], cp_line[1]):
-            reward += 10.0 
+            self.total_checkpoints += 1
+            reward += 20.0 
             if self.current_checkpoint == len(self.checkpoints) - 1:
                 self.laps += 1
+                # Бонус за швидкий круг: рахуємо тільки кроки цього кола
+                lap_time_bonus = max(0, (2000 - self.lap_steps) * 0.1)
+                reward += lap_time_bonus
+                self.lap_steps = 0  # скидаємо для наступного кола
             self.current_checkpoint = (self.current_checkpoint + 1) % len(self.checkpoints)
 
-        observation = self._get_lidar_data()
-        truncated = False
+        # ОНОВЛЮЄМО МИНУЛУ ДІЮ ДЛЯ НАСТУПНОГО КАДРУ
+        self.prev_action = np.copy(action)
 
-        return observation, reward, terminated, truncated, {}
+        observation = self._get_observation()
+        truncated = False
+        progress = self.total_checkpoints / len(self.checkpoints)
+
+        return observation, reward, terminated, truncated, {
+            "checkpoints": self.total_checkpoints,
+            "progress": progress
+        }
 
     # Допоміжна функція для малювання шкал
     def _draw_bar(self, label, value, min_val, max_val, x, y, color):
@@ -205,13 +283,10 @@ class CarRacingCustom(gym.Env):
         bar_w = 120
         bar_h = 15
         
-        # Рамка
         pygame.draw.rect(self.screen, (100, 100, 100), (bar_x, bar_y, bar_w, bar_h), 2)
         
-        # Конвертуємо numpy-тип у звичайне число
         val = float(value)
         
-        # Заповнення
         if min_val < 0: # Для керма
             center_x = int(bar_x + bar_w / 2)
             fill_w = int(abs(val) * (bar_w / 2))
@@ -229,98 +304,56 @@ class CarRacingCustom(gym.Env):
             pygame.init()
             self.window_width = min(1280, self.width)
             self.window_height = min(720, self.track_height) + self.panel_height
-            self.screen = pygame.display.set_mode((self.window_width, self.window_height), pygame.RESIZABLE)
+            self.screen = pygame.display.set_mode((self.window_width, self.window_height),
+                                                    pygame.DOUBLEBUF | pygame.HWSURFACE)
             self.clock = pygame.time.Clock()
-            self.font = pygame.font.SysFont('Arial', 20) 
-            self.cam_x = 0.0
-            self.cam_y = 0.0
-            self.zoom = 1.0
-            self.panning = False
-            self.pan_start_mouse = (0, 0)
-            self.pan_start_cam = (0, 0)
-            self.render_surface = pygame.Surface((self.width, self.track_height))
+            self.font = pygame.font.SysFont('Arial', 20)
+            self._lidar_angles = np.linspace(-math.pi/2, math.pi/2, self.num_rays)
+            self.track_image = self.track_image.convert()
 
-        # Process events first for responsiveness
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 raise KeyboardInterrupt
-            elif event.type == pygame.VIDEORESIZE:
-                self.window_width, self.window_height = event.w, event.h
-                self.screen = pygame.display.set_mode((self.window_width, self.window_height), pygame.RESIZABLE)
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 2: # Middle click
-                    self.panning = True
-                    self.pan_start_mouse = pygame.mouse.get_pos()
-                    self.pan_start_cam = (self.cam_x, self.cam_y)
-            elif event.type == pygame.MOUSEBUTTONUP:
-                if event.button == 2:
-                    self.panning = False
-            elif event.type == pygame.MOUSEMOTION:
-                if self.panning:
-                    mouse_pos = pygame.mouse.get_pos()
-                    self.cam_x = self.pan_start_cam[0] + (mouse_pos[0] - self.pan_start_mouse[0])
-                    self.cam_y = self.pan_start_cam[1] + (mouse_pos[1] - self.pan_start_mouse[1])
-            elif event.type == pygame.MOUSEWHEEL:
-                mouse_pos = pygame.mouse.get_pos()
-                if mouse_pos[1] < self.window_height - self.panel_height:
-                    old_world_x = (mouse_pos[0] - self.cam_x) / self.zoom
-                    old_world_y = (mouse_pos[1] - self.cam_y) / self.zoom
-                    if event.y > 0:
-                        self.zoom = min(5.0, self.zoom * 1.1)
-                    elif event.y < 0:
-                        self.zoom = max(0.1, self.zoom / 1.1)
-                    self.cam_x = mouse_pos[0] - old_world_x * self.zoom
-                    self.cam_y = mouse_pos[1] - old_world_y * self.zoom
 
-        # Заливаємо екран чорним
-        self.screen.fill((0, 0, 0)) 
-        
-        # Трек
-        self.render_surface.blit(self.track_image, (0, 0))
+        view_h = self.window_height - self.panel_height
+        self.screen.fill((0, 0, 0))
+
+        # Камера центрується на машині
+        ox = int(self.window_width / 2 - self.car_x)
+        oy = int(view_h / 2 - self.car_y)
+
+        self.screen.blit(self.track_image, (ox, oy))
 
         target_cp = self.checkpoints[self.current_checkpoint]
-        pygame.draw.line(self.render_surface, (0, 0, 255), (target_cp["x1"], target_cp["y1"]), (target_cp["x2"], target_cp["y2"]), 3)
+        pygame.draw.line(self.screen, (0, 0, 255),
+                        (int(target_cp["x1"] + ox), int(target_cp["y1"] + oy)),
+                        (int(target_cp["x2"] + ox), int(target_cp["y2"] + oy)), 3)
 
-        angles = np.linspace(-math.pi/2, math.pi/2, self.num_rays)
-        obs = self._get_lidar_data()
-        for i, a in enumerate(angles):
+        cx = int(self.car_x + ox)
+        cy = int(self.car_y + oy)
+        for i, a in enumerate(self._lidar_angles):
             ray_angle = self.angle + a
-            end_x = self.car_x + obs[i] * self.max_ray_length * math.cos(ray_angle)
-            end_y = self.car_y - obs[i] * self.max_ray_length * math.sin(ray_angle)
-            pygame.draw.line(self.render_surface, (0, 255, 0), (int(self.car_x), int(self.car_y)), (int(end_x), int(end_y)), 2)
+            end_x = int(cx + self.cached_lidar[i] * self.max_ray_length * math.cos(ray_angle))
+            end_y = int(cy - self.cached_lidar[i] * self.max_ray_length * math.sin(ray_angle))
+            pygame.draw.line(self.screen, (0, 255, 0), (cx, cy), (end_x, end_y), 2)
 
-        car_length = 20
-        car_width = 10
-        car_surface = pygame.Surface((car_length, car_width), pygame.SRCALPHA)
-        car_surface.fill((200, 0, 0)) 
-        
+        car_surface = pygame.Surface((20, 10), pygame.SRCALPHA)
+        car_surface.fill((200, 0, 0))
         rotated_car = pygame.transform.rotate(car_surface, math.degrees(self.angle))
-        rect = rotated_car.get_rect(center=(self.car_x, self.car_y))
-        self.render_surface.blit(rotated_car, rect.topleft)
+        rect = rotated_car.get_rect(center=(cx, cy))
+        self.screen.blit(rotated_car, rect.topleft)
 
-        # Scale and blit render_surface to screen
-        if self.zoom == 1.0:
-            scaled_surf = self.render_surface
-        else:
-            scaled_surf = pygame.transform.smoothscale(self.render_surface, 
-                            (int(self.width * self.zoom), int(self.track_height * self.zoom)))
-        
-        self.screen.blit(scaled_surf, (self.cam_x, self.cam_y))
-
-        # --- ПАНЕЛЬ ПРИЛАДІВ ---
         panel_y = self.window_height - self.panel_height
         pygame.draw.rect(self.screen, (40, 40, 40), (0, panel_y, self.window_width, self.panel_height))
         pygame.draw.line(self.screen, (200, 200, 200), (0, panel_y), (self.window_width, panel_y), 3)
 
-        # Текстова інформація
         lap_text = self.font.render(f"Laps: {self.laps}", True, (255, 255, 255))
         self.screen.blit(lap_text, (30, panel_y + 20))
         
         speed_text = self.font.render(f"Speed: {self.speed:.1f} / {self.max_speed}", True, (255, 255, 255))
         self.screen.blit(speed_text, (30, panel_y + 60))
 
-        # Шкали дій
-        self._draw_bar("Steer", self.current_action[0], -1.0, 1.0, 250, panel_y + 40, (0, 200, 255))
+        self._draw_bar("Steer", self.current_steering, -1.0, 1.0, 250, panel_y + 40, (0, 200, 255))
         self._draw_bar("Gas", self.current_action[1], 0.0, 1.0, 500, panel_y + 20, (0, 255, 0))
         self._draw_bar("Brake", self.current_action[2], 0.0, 1.0, 500, panel_y + 60, (255, 0, 0))
 

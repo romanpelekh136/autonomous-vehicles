@@ -1,36 +1,62 @@
 import gymnasium as gym
 import optuna
+import numpy as np
+import random
+import subprocess
+import webbrowser
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
 from custom_env import CarRacingCustom
+from stable_baselines3.common.monitor import Monitor
 
-# Реєструємо середовище
+def linear_schedule(initial_value):
+    def func(progress_remaining):
+        return progress_remaining * initial_value
+    return func
+
+
+class CheckpointMetricCallback(BaseCallback):
+    def __init__(self):
+        super().__init__()
+        self.ep_progress = []
+
+    def _on_step(self):
+        for info in self.locals.get("infos", []):
+            if "progress" in info:
+                self.ep_progress.append(info["progress"])
+                if len(self.ep_progress) >= 100:
+                    mean_prog = np.mean(self.ep_progress)
+                    self.logger.record("custom/mean_progress", mean_prog)
+                    self.ep_progress = []
+        return True
+
 gym.envs.registration.register(
     id='CarRacingCustom-v0',
     entry_point='custom_env:CarRacingCustom',
     max_episode_steps=2000
 )
-
-# Перемикач режимів:
-# True - шукаємо ідеальні параметри (Optuna)
-# False - тренуємо модель на максимум з готовими параметрами
+def make_env():
+    tracks = [ "track_02", "track_03", "track_04"]
+    track = random.choice(tracks)
+    def _init():
+        return Monitor(gym.make('CarRacingCustom-v0', track_name=track))
+    return _init
 OPTIMIZE = False
 
 def optimize_ppo(trial):
-    # 1. Optuna пропонує випадкові гіперпараметри для цієї спроби
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
-    gamma = trial.suggest_float("gamma", 0.90, 0.9999)
-    ent_coef = trial.suggest_float("ent_coef", 0.0, 0.05)
-    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
-    n_steps = trial.suggest_categorical("n_steps", [128, 256, 512, 1024])
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+    gamma = trial.suggest_float("gamma", 0.95, 0.999)
+    ent_coef = trial.suggest_float("ent_coef", 1e-8, 0.01, log=True)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.3)
+    n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048])
     batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
-    
-    # 2. Створюємо паралельне середовище
-    env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv, env_kwargs={"track_name": "track_01"})
-    
-    # 3. Ініціалізуємо модель з параметрами від Optuna
+    target_kl = trial.suggest_float("target_kl", 0.01, 0.05)
+    n_epochs = trial.suggest_int("n_epochs", 3, 15)
+
+    env = SubprocVecEnv([make_env() for _ in range(8)])
+
     model = PPO(
         "MlpPolicy", 
         env, 
@@ -40,36 +66,54 @@ def optimize_ppo(trial):
         clip_range=clip_range,
         n_steps=n_steps,
         batch_size=batch_size,
+        target_kl=target_kl,
+        n_epochs=n_epochs,
+        policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[512, 512])),
         verbose=0,
         device="cpu"
     )
-    
-    # 4. Швидке тренування (збільшено до 150 000 кроків для адекватної оцінки)
+
     try:
-        model.learn(total_timesteps=150000)
+        model.learn(total_timesteps=1_000_000)
     except Exception as e:
         env.close()
-        return -1000.0
+        return -10000.0
 
-    # 5. Оцінюємо наскільки добре вона навчилася (тестуємо 5 епізодів)
-    eval_env = gym.make('CarRacingCustom-v0', track_name="track_01")
+    eval_env = SubprocVecEnv([
+        lambda: gym.make('CarRacingCustom-v0', track_name="track_02"),
+        lambda: gym.make('CarRacingCustom-v0', track_name="track_03"),
+        lambda: gym.make('CarRacingCustom-v0', track_name="track_04")
+    ])
+    
+    total_progress = []
     try:
-        mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=5)
+        for _ in range(3): # 3 епізоди на кожну трасу
+            obs = eval_env.reset()
+            dones = np.array([False, False, False])
+            episode_progresses = [0.0] * 3
+            
+            while not all(dones):
+                action, _ = model.predict(obs, deterministic=True)
+                obs, _, current_dones, infos = eval_env.step(action)
+                
+                for i in range(3):
+                    if not dones[i]:
+                        if "progress" in infos[i]:
+                            episode_progresses[i] = infos[i]["progress"]
+                        if current_dones[i]:
+                            dones[i] = True
+                            
+            total_progress.extend(episode_progresses)
     finally:
         env.close()
         eval_env.close()
-    
-    # Optuna буде намагатися максимізувати цей результат
-    return mean_reward
+
+    return np.mean(total_progress) if total_progress else 0.0
 
 if __name__ == '__main__':
     if OPTIMIZE:
         print("Запуск Optuna. Шукаємо ідеальні параметри...")
-        # Створюємо "дослідження"
         study = optuna.create_study(direction="maximize")
-        
-        # Запускаємо 50 спроб (trials)
-        # n_jobs=1 тому що одне тренування вже використовує всі 8 ядер через SubprocVecEnv
         study.optimize(optimize_ppo, n_trials=50, n_jobs=1) 
         
         print("\n=== Оптимізація завершена ===")
@@ -77,23 +121,50 @@ if __name__ == '__main__':
         print(study.best_params)
         
     else:
-        # Твій звичайний блок для фінального довгого навчання
-        # (Впиши сюди найкращі параметри після оптимізації)
         best_params = {
-            'learning_rate': 0.0001417252777348529, 
-            'gamma': 0.984848197853803, 
-            'ent_coef': 0.005347766258285577, 
-            'clip_range': 0.11224583877971807, 
-            'n_steps': 1024, 
-            'batch_size': 64
+          'learning_rate': linear_schedule(0.00011308338187272194),  # старий
+          'gamma': 0.983,           # старий — довший горизонт
+          'ent_coef': 0.0035,       # від Optuna
+          'clip_range': 0.176,      # від Optuna
+          'n_steps': 1024,          # старий
+          'batch_size': 128,        # старий
+          'target_kl': 0.0196,      # від Optuna — новий корисний
+          'n_epochs': 10,
         }
         
         print("Починаємо фінальне навчання з найкращими параметрами...")
-        env = make_vec_env('CarRacingCustom-v0', n_envs=8, vec_env_cls=SubprocVecEnv)
-        model = PPO("MlpPolicy", env, verbose=1, device="cpu", **best_params)
+        env = SubprocVecEnv([make_env() for _ in range(8)])
         
-        model.learn(total_timesteps=5000000)
+        model = PPO("MlpPolicy", env, verbose=1, device="cpu",
+                    tensorboard_log="./tb_logs/",
+                    policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[512, 512])),
+                    **best_params)
+        
+        tb_process = subprocess.Popen(
+            ["tensorboard", "--logdir=./tb_logs/", "--port=6006", "--reload_interval=5"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        webbrowser.open("http://localhost:6006")
+        print("TensorBoard запущено: http://localhost:6006")
+        
+        eval_env = SubprocVecEnv([
+            lambda: gym.make('CarRacingCustom-v0', track_name="track_02"),
+            lambda: gym.make('CarRacingCustom-v0', track_name="track_03"),
+            lambda: gym.make('CarRacingCustom-v0', track_name="track_04")
+        ])
+        eval_cb = EvalCallback(
+            eval_env,
+            best_model_save_path="./best_model/",
+            eval_freq=25_000 // 8,
+            n_eval_episodes=5,
+            deterministic=True,
+            verbose=1
+        )
+        cp_callback = CheckpointMetricCallback()
+
+        model.learn(total_timesteps=5000000, callback=CallbackList([eval_cb, cp_callback]))
         
         model.save("ppo_car_racing_optimized")
         print("Модель збережено!")
+        eval_env.close()
         env.close()
