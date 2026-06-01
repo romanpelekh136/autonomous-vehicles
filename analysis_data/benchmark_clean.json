@@ -1,0 +1,58 @@
+{
+  "track_01": {
+    "ppo": {
+      "mean_progress": 5.326530612244897,
+      "max_progress": 5.326530612244898,
+      "std_progress": 8.881784197001252e-16,
+      "crash_rate": 0.0
+    },
+    "neat": {
+      "mean_progress": 4.775510204081632,
+      "max_progress": 4.775510204081633,
+      "std_progress": 8.881784197001252e-16,
+      "crash_rate": 0.0
+    }
+  },
+  "track_02": {
+    "ppo": {
+      "mean_progress": 18.449999999999996,
+      "max_progress": 18.45,
+      "std_progress": 3.552713678800501e-15,
+      "crash_rate": 0.0
+    },
+    "neat": {
+      "mean_progress": 17.0,
+      "max_progress": 17.0,
+      "std_progress": 0.0,
+      "crash_rate": 0.0
+    }
+  },
+  "track_03": {
+    "ppo": {
+      "mean_progress": 13.846153846153848,
+      "max_progress": 13.846153846153847,
+      "std_progress": 1.7763568394002505e-15,
+      "crash_rate": 0.0
+    },
+    "neat": {
+      "mean_progress": 12.384615384615385,
+      "max_progress": 12.384615384615385,
+      "std_progress": 0.0,
+      "crash_rate": 0.0
+    }
+  },
+  "track_04": {
+    "ppo": {
+      "mean_progress": 7.526315789473682,
+      "max_progress": 7.526315789473684,
+      "std_progress": 1.7763568394002505e-15,
+      "crash_rate": 0.0
+    },
+    "neat": {
+      "mean_progress": 6.789473684210526,
+      "max_progress": 6.7894736842105265,
+      "std_progress": 8.881784197001252e-16,
+      "crash_rate": 0.0
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "ppo": {
+    "total_timesteps": 5000000,
+    "n_envs": 8,
+    "total_env_interactions": 40000000,
+    "training_time_min": 40.27,
+    "n_parameters": 350468,
+    "architecture": "MlpPolicy pi=[256,256] vf=[512,512]",
+    "optimizer": "Adam (Optuna-tuned)"
+  },
+  "neat": {
+    "generations": 385,
+    "population_size": 150,
+    "total_env_interactions": 103950000,
+    "winner_nodes": 3,
+    "winner_connections": 27,
+    "architecture": "FeedForward, no hidden layers initially",
+    "activation": "tanh"
+  }
+}
